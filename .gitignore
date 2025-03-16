@@ -25,3 +25,6 @@ go.work
 *.swp
 *.swo
 *~
+
+hack/tools/apigen
+bin/*

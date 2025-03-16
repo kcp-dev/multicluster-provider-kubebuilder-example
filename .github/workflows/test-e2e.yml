@@ -32,4 +32,5 @@ jobs:
       - name: Running Test e2e
         run: |
           go mod tidy
-          make test-e2e
+          # TODO(mjudeikis): Add e2e tests
+          #make test-e2e

@@ -96,8 +96,8 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+run: manifests kcp-tools generate kcp-generate fmt vet ## Run a controller from your host.
+	go run ./cmd/main.go --server=$$(kubectl get apiexport apis.contrib.kcp.io -o jsonpath="{.status.virtualWorkspaces[0].url}")
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -222,3 +222,30 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
+
+# MUTLICLUSTER-PROVIDER KCP SPECIFIC:
+TOOLS_DIR=hack/tools
+ARCH := $(shell go env GOARCH)
+OS := $(shell go env GOOS)
+
+KCP_APIGEN_BIN := apigen
+KCP_APIGEN_VERSION ?= 0.27.0-rc.1
+# Construct the download URL.
+DOWNLOAD_URL = https://github.com/kcp-dev/kcp/releases/download/v$(KCP_APIGEN_VERSION)/apigen_$(KCP_APIGEN_VERSION)_$(OS)_$(ARCH).tar.gz
+KCP_APIGEN_GEN := $(TOOLS_DIR)/$(KCP_APIGEN_BIN)
+export KCP_APIGEN_GEN # so hack scripts can use it
+
+# TODO: move to binary to avoid depeendencies
+$(KCP_APIGEN_GEN):
+# Create a temporary directory for download and extraction
+	TMP_DIR=$$(mktemp -d) ; \
+		curl -L -o $$TMP_DIR/apigen.tar.gz $(DOWNLOAD_URL) ; \
+		tar -xzf $$TMP_DIR/apigen.tar.gz -C $$TMP_DIR ; \
+		mv $$TMP_DIR/bin/apigen $(KCP_APIGEN_GEN) ; \
+		rm -rf $$TMP_DIR
+
+kcp-tools: $(KCP_APIGEN_GEN) 
+.PHONY: kcp-tools
+
+kcp-generate:
+	$(TOOLS_DIR)/apigen --input-dir ./config/crd/bases --output-dir ./config/kcp    

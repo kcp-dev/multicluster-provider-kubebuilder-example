@@ -17,14 +17,23 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
+
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/multicluster-provider/virtualworkspace"
+	mcbuilder "github.com/multicluster-runtime/multicluster-runtime/pkg/builder"
+	mcmanager "github.com/multicluster-runtime/multicluster-runtime/pkg/manager"
+	mcreconcile "github.com/multicluster-runtime/multicluster-runtime/pkg/reconcile"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -32,12 +41,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	apisv1alpha1 "github.com/kcp-dev/multicluster-provider-kubebuilder-example/api/v1alpha1"
+	applicationapisv1alpha1 "github.com/kcp-dev/multicluster-provider-kubebuilder-example/api/v1alpha1"
 	"github.com/kcp-dev/multicluster-provider-kubebuilder-example/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -49,7 +61,8 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
+	// MULTICLUSTER: This is where it differ from the default scaffold.
+	utilruntime.Must(applicationapisv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(apisv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -63,6 +76,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var server string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -81,6 +95,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	// MULTICLUSTER: This is where it differ from the default scaffold.
+	flag.StringVar(&server, "server", "", "Override for kubeconfig server URL")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -178,13 +194,31 @@ func main() {
 		})
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// MULTICLUSTER: This is where it differ from the default scaffold.
+	ctx := signals.SetupSignalHandler()
+
+	cfg := ctrl.GetConfigOrDie()
+	cfg = rest.CopyConfig(cfg)
+	if server != "" {
+		cfg.Host = server
+	}
+
+	var err error
+	provider, err := virtualworkspace.New(cfg, &apisv1alpha1.APIBinding{}, virtualworkspace.Options{
+		Scheme: scheme,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to construct cluster provider")
+		os.Exit(1)
+	}
+
+	mgr, err := mcmanager.New(cfg, provider, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "3e918dde.contrib.kcp.io",
+		LeaderElectionID:       "e3eac106.contrib.kcp.io",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -202,30 +236,48 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.ApplicationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	if err := mcbuilder.ControllerManagedBy(mgr).
+		Named("kcp-applications-controller").
+		For(&applicationapisv1alpha1.Application{}).
+		Complete(mcreconcile.Func(
+			func(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
+				log := log.FromContext(ctx).WithValues("cluster", req.ClusterName)
+				log.Info("Reconciling Application")
+
+				cl, err := mgr.GetCluster(ctx, req.ClusterName)
+				if err != nil {
+					return reconcile.Result{}, fmt.Errorf("failed to get cluster: %w", err)
+				}
+				client := cl.GetClient()
+
+				reconciler := &controller.ApplicationReconciler{
+					Client: client,
+					Scheme: cl.GetScheme(),
+				}
+				return reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: req.NamespacedName})
+			},
+		)); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Application")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 
-	if metricsCertWatcher != nil {
-		setupLog.Info("Adding metrics certificate watcher to manager")
-		if err := mgr.Add(metricsCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add metrics certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
-	if webhookCertWatcher != nil {
-		setupLog.Info("Adding webhook certificate watcher to manager")
-		if err := mgr.Add(webhookCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
+	// TODO(mjudeikis): This needs to be implemented in mcmanager.
+	// if metricsCertWatcher != nil {
+	//	setupLog.Info("Adding metrics certificate watcher to manager")
+	//	if err := mgr.Add(metricsCertWatcher); err != nil {
+	//		setupLog.Error(err, "unable to add metrics certificate watcher to manager")
+	//		os.Exit(1)
+	//	}
+	// }
+	//
+	// if webhookCertWatcher != nil {
+	//	setupLog.Info("Adding webhook certificate watcher to manager")
+	//	if err := mgr.Add(webhookCertWatcher); err != nil {
+	//		setupLog.Error(err, "unable to add webhook certificate watcher to manager")
+	//		os.Exit(1)
+	//	}
+	// }
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -237,7 +289,18 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if provider != nil {
+		setupLog.Info("Starting provider")
+		go func() {
+			if err := provider.Run(ctx, mgr); err != nil {
+				setupLog.Error(err, "unable to run provider")
+				os.Exit(1)
+			}
+		}()
+	}
+
+	setupLog.Info("starting manager", "server", server)
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
